@@ -58,6 +58,35 @@ for playlist-adds is simply absent for ratings.
 
 ## Root Cause Analysis Entries
 
+### Issue #4 — Notified for playlist-add but not for rating
+
+**How I reproduced it:** Rated a song ("Block Party") owned by a different
+user via `rate_song()` in `flask shell`. Checked that owner's notifications
+immediately after via `get_notifications()` — result was an empty list (0
+notifications), confirming no notification is created when a song is rated.
+
+**How I found the root cause:** Read `notification_service.py` end to end.
+`add_to_playlist()` has a clear pattern: after mutating data, it checks
+`if song.shared_by != added_by_user_id` and calls `create_notification()`
+with a type and message. `rate_song()` saves/updates a `Rating` record and
+commits, but has no equivalent block afterward — no self-check, no
+`create_notification()` call anywhere in the function.
+
+**The root cause:** The notification-on-interaction pattern used elsewhere
+in this file was never implemented for the rating flow. It's not a broken
+condition or typo — it's a missing block of logic. `rate_song()` persists
+the rating correctly but silently exits without ever notifying the song's
+original sharer.
+
+**My fix and side-effect check:** Added a notification block at the end of
+`rate_song()`, mirroring `add_to_playlist()`'s pattern exactly: skip
+self-ratings (`song.shared_by != user_id`), otherwise call
+`create_notification()` with type `"song_rated"` and a message using the
+already-fetched `song` and `rater` objects (no extra DB queries needed).
+Verified via `flask shell` that rating a song now creates exactly one
+notification with the correct body text. The rating-save logic itself is
+untouched, so existing rating behavior (create/update) is unaffected.
+
 ### Issue #5 — Last song in a playlist never shows up
 
 **How I reproduced it:** Created a test playlist and inserted 4 songs into
