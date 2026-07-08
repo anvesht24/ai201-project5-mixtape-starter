@@ -1,5 +1,43 @@
 # Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used Claude throughout this project for codebase navigation and debugging support, not for generating fixes blindly.
+
+**Codebase orientation:** I pasted `models.py`, `services/playlist_service.py`,
+`routes/playlists.py`, `services/notification_service.py`,
+`services/streak_service.py`, and `services/feed_service.py` to Claude and asked
+it to help me trace what each function did and how routes connected to services.
+This helped me build the codebase map before touching any issue.
+
+**Bug diagnosis:** For each bug, Claude asked me guided questions rather than
+stating the root cause outright — for example, walking through what
+`songs[:-1]` does to a list, and what `datetime.weekday()` returns for each
+day, before confirming my own reasoning. This forced me to verify the logic
+myself rather than just accepting an answer.
+
+**Reproduction:** Claude helped me write `flask shell` scripts to reproduce
+each bug with controlled data (e.g., forcing a specific date to be a Sunday
+to test the streak bug) before any code was changed. During this, I ran into
+real debugging obstacles — a syntax error caused by smart quotes when pasting
+into the shell, and a test-data mistake where I anchored `last_listened_at` to
+the wrong reference date, which made the Sunday bug look worse than it was.
+I had to identify and fix these issues myself with Claude's help interpreting
+the tracebacks, which reinforced that AI explanations still need verification
+against actual runtime behavior.
+
+**Where I verified/overrode AI output:** When my Sunday-bug reproduction
+initially failed (streak reset to 1 in a case where it should have
+incremented), Claude and I worked through the actual dates being used and
+found the test script's date math was wrong, not the underlying fix — I
+verified this myself by recalculating the day gap manually before accepting
+the explanation.
+
+**Fix implementation:** For each bug, I applied the minimal fix Claude
+suggested (removing the `[:-1]` slice, adding a missing notification block,
+removing the Sunday-specific condition), then verified each one myself via
+`flask shell` before committing.
+
 ## Codebase Map
 
 ### Main files and their roles
@@ -40,7 +78,7 @@ songs in the playlist," but the actual return statement is
 `[song.to_dict() for song in songs[:-1]]` — a Python slice that drops the last
 element of the ordered list. This means the function under-returns by one song,
 and the route's `count` field reflects the truncated list, not the true total.
-(Flagged for investigation — Issue #5. Not yet formally reproduced or fixed.)
+(See Issue #5 root cause analysis below for the fix.)
 
 ### Data flow #2 — adding a song to a playlist (and the notification pattern)
 
@@ -54,9 +92,40 @@ Compared to `rate_song()` in the same file: rate_song() saves a Rating record
 (creating or updating) but has no equivalent notification block at all — no
 self-check, no `create_notification()` call. The notification pattern that exists
 for playlist-adds is simply absent for ratings.
-(Flagged for investigation — Issue #4. Not yet formally reproduced or fixed.)
+(See Issue #4 root cause analysis below for the fix.)
 
 ## Root Cause Analysis Entries
+
+### Issue #1 — Listening streak keeps resetting
+
+**How I reproduced it:** In `flask shell`, set a user's `listening_streak`
+to 5 and `last_listened_at` to exactly one day before a forced Sunday date.
+Called `update_listening_streak()` with that Sunday as `now`. Expected the
+streak to increment to 6 (one day passed, valid consecutive listen), but it
+reset to 1 instead.
+
+**How I found the root cause:** Read `update_listening_streak()` in
+`streak_service.py`. The docstring states the streak should increment
+whenever exactly one day has passed since the last listen. The actual
+condition was `elif days_since_last == 1 and today.weekday() != 6:` — an
+extra clause checking the current day of the week, which has no basis in
+the documented streak rules.
+
+**The root cause:** Python's `datetime.weekday()` returns `6` for Sunday.
+The code's condition `today.weekday() != 6` evaluates to `False` whenever
+today is a Sunday, which makes the entire `elif` (streak increment)
+condition `False` on Sundays — even when `days_since_last == 1` is `True`.
+This causes execution to fall through to the `else` branch, resetting the
+streak to 1, even though the user listened on consecutive days. Every
+other day of the week, `weekday() != 6` is `True`, so the increment works
+correctly — the bug is isolated entirely to Sundays.
+
+**My fix and side-effect check:** Removed the `and today.weekday() != 6`
+clause, leaving `elif days_since_last == 1:`. Verified in `flask shell`
+that a user with a 1-day gap now correctly increments from 5 to 6 on a
+forced Sunday date. Also tested the boundary on a forced Monday date with
+the same setup — confirmed the streak still increments correctly(5 to 6),
+ensuring the fix didn't break the normal weekday case.
 
 ### Issue #4 — Notified for playlist-add but not for rating
 
@@ -115,32 +184,3 @@ for both the `songs` list and the `count` field in its JSON response —
 both are now correct automatically, since they both derive from the same
 (now-complete) list. No other code in the codebase calls this function.
 
-### Issue #1 — Listening streak keeps resetting
-
-**How I reproduced it:** In `flask shell`, set a user's `listening_streak`
-to 5 and `last_listened_at` to exactly one day before a forced Sunday date.
-Called `update_listening_streak()` with that Sunday as `now`. Expected the
-streak to increment to 6 (one day passed, valid consecutive listen), but it
-reset to 1 instead.
-
-**How I found the root cause:** Read `update_listening_streak()` in
-`streak_service.py`. The docstring states the streak should increment
-whenever exactly one day has passed since the last listen. The actual
-condition was `elif days_since_last == 1 and today.weekday() != 6:` — an
-extra clause checking the current day of the week, which has no basis in
-the documented streak rules.
-
-**The root cause:** Python's `datetime.weekday()` returns `6` for Sunday.
-The code's condition `today.weekday() != 6` evaluates to `False` whenever
-today is a Sunday, which makes the entire `elif` (streak increment)
-condition `False` on Sundays — even when `days_since_last == 1` is `True`.
-This causes execution to fall through to the `else` branch, resetting the
-streak to 1, even though the user listened on consecutive days. Every
-other day of the week, `weekday() != 6` is `True`, so the increment works
-correctly — the bug is isolated entirely to Sundays.
-
-**My fix and side-effect check:** Removed the `and today.weekday() != 6`
-clause, leaving `elif days_since_last == 1:`. Verified in `flask shell`
-that a user with a 1-day gap now correctly increments from 5 to 6 on a
-forced Sunday date. Also tested the boundary on a forced Monday date with
-the same setup — confirmed the streak still increments correctly
